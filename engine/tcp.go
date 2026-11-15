@@ -27,7 +27,8 @@ const (
 
 type tcpContext struct {
 	*gopacket.PacketMetadata
-	Verdict tcpVerdict
+	Verdict  tcpVerdict
+	RuleName string
 }
 
 func (ctx *tcpContext) GetCaptureInfo() gopacket.CaptureInfo {
@@ -41,6 +42,11 @@ type tcpStreamFactory struct {
 
 	RulesetMutex sync.RWMutex
 	Ruleset      ruleset.Ruleset
+
+	// tcpAnsScratch is reused by New to collect TCP analyzers without
+	// allocating a new slice for every stream. New is only called from
+	// the worker goroutine that owns this factory.
+	tcpAnsScratch []analyzer.TCPAnalyzer
 }
 
 func (f *tcpStreamFactory) New(ipFlow, tcpFlow gopacket.Flow, tcp *layers.TCP, ac reassembly.AssemblerContext) reassembly.Stream {
@@ -55,36 +61,51 @@ func (f *tcpStreamFactory) New(ipFlow, tcpFlow gopacket.Flow, tcp *layers.TCP, a
 		DstPort:  uint16(tcp.DstPort),
 		Props:    make(analyzer.CombinedPropMap),
 	}
+	info.CacheStrings()
 	f.Logger.TCPStreamNew(f.WorkerID, info)
 	f.RulesetMutex.RLock()
 	rs := f.Ruleset
 	f.RulesetMutex.RUnlock()
-	ans := analyzersToTCPAnalyzers(rs.Analyzers(info))
-	// Create entries for each analyzer
-	entries := make([]*tcpStreamEntry, 0, len(ans))
-	for _, a := range ans {
-		entries = append(entries, &tcpStreamEntry{
-			Name: a.Name(),
+	f.tcpAnsScratch = f.tcpAnsScratch[:0]
+	for _, a := range rs.Analyzers(info) {
+		if tcpA, ok := a.(analyzer.TCPAnalyzer); ok {
+			f.tcpAnsScratch = append(f.tcpAnsScratch, tcpA)
+		}
+	}
+	ans := f.tcpAnsScratch
+	// Allocate entries, loggers and the active pointer slice contiguously so
+	// creating a stream costs a constant number of allocations instead of
+	// one per analyzer.
+	entries := make([]tcpStreamEntry, len(ans))
+	loggers := make([]analyzerLogger, len(ans))
+	active := make([]*tcpStreamEntry, len(ans))
+	for i, a := range ans {
+		name := a.Name()
+		limit := a.Limit()
+		loggers[i] = analyzerLogger{
+			StreamID: id.Int64(),
+			Name:     name,
+			Logger:   f.Logger,
+		}
+		entries[i] = tcpStreamEntry{
+			Name: name,
 			Stream: a.NewTCP(analyzer.TCPInfo{
 				SrcIP:   ipSrc,
 				DstIP:   ipDst,
 				SrcPort: uint16(tcp.SrcPort),
 				DstPort: uint16(tcp.DstPort),
-			}, &analyzerLogger{
-				StreamID: id.Int64(),
-				Name:     a.Name(),
-				Logger:   f.Logger,
-			}),
-			HasLimit: a.Limit() > 0,
-			Quota:    a.Limit(),
-		})
+			}, &loggers[i]),
+			HasLimit: limit > 0,
+			Quota:    limit,
+		}
+		active[i] = &entries[i]
 	}
 	return &tcpStream{
 		info:          info,
 		virgin:        true,
 		logger:        f.Logger,
 		ruleset:       rs,
-		activeEntries: entries,
+		activeEntries: active,
 	}
 }
 
@@ -103,6 +124,7 @@ type tcpStream struct {
 	activeEntries []*tcpStreamEntry
 	doneEntries   []*tcpStreamEntry
 	lastVerdict   tcpVerdict
+	lastRuleName  string
 }
 
 type tcpStreamEntry struct {
@@ -121,6 +143,7 @@ func (s *tcpStream) Accept(tcp *layers.TCP, ci gopacket.CaptureInfo, dir reassem
 	} else {
 		ctx := ac.(*tcpContext)
 		ctx.Verdict = s.lastVerdict
+		ctx.RuleName = s.lastRuleName
 		return false
 	}
 }
@@ -153,7 +176,9 @@ func (s *tcpStream) ReassembledSG(sg reassembly.ScatterGather, ac reassembly.Ass
 		if action != ruleset.ActionMaybe && action != ruleset.ActionModify {
 			verdict := actionToTCPVerdict(action)
 			s.lastVerdict = verdict
+			s.lastRuleName = result.RuleName
 			ctx.Verdict = verdict
+			ctx.RuleName = result.RuleName
 			s.logger.TCPStreamAction(s.info, action, false)
 			// Verdict issued, no need to process any more packets
 			s.closeActiveEntries()
@@ -204,16 +229,6 @@ func (s *tcpStream) feedEntry(entry *tcpStreamEntry, rev, start, end bool, skip 
 		}
 	}
 	return
-}
-
-func analyzersToTCPAnalyzers(ans []analyzer.Analyzer) []analyzer.TCPAnalyzer {
-	tcpAns := make([]analyzer.TCPAnalyzer, 0, len(ans))
-	for _, a := range ans {
-		if tcpM, ok := a.(analyzer.TCPAnalyzer); ok {
-			tcpAns = append(tcpAns, tcpM)
-		}
-	}
-	return tcpAns
 }
 
 func actionToTCPVerdict(a ruleset.Action) tcpVerdict {

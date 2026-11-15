@@ -38,3 +38,21 @@ OpenGFW 是一个 Linux 上灵活、易用、开源的 DIY [GFW](https://zh.wiki
 - VPN/代理服务滥用防护
 - 流量分析 (纯日志模式)
 - 助你实现你的独裁野心
+
+## 变更记录
+
+- 移除 iptables 相关代码，仅保留 nftables
+- IO 配置新增 `tcp` / `udp` / `ipv4` / `ipv6` 协议过滤选项（均未配置时默认全捕获；tcp 与 udp、ipv4 与 ipv6 不能同时为 false），nftables 规则按配置的地址族×协议组合生成
+- 修复 TCP 重组内存泄漏：定期 `FlushCloseOlderThan` 清理超时流
+- 修复 UDP 流内存泄漏：LRU 淘汰时释放对应 analyzer 资源
+- Go 版本升级至 1.26（`go.mod` 与 Release 构建同步）
+- 启用 PGO（Profile-Guided Optimization）：新增规则匹配基准测试 `BenchmarkMatch`，基于其 profile 生成 `default.pgo`，构建时自动生效
+- 新增 nftables 连接卸载（offload）功能：出站按 `远端IP:远端端口`、入站按 `客户端IP:容器IP:服务端口` 统计，达到阈值后添加带 TTL 的 nftables 集合元素，后续连接内核直达不再进用户态分析；TTL 到期后重新采样
+  - 方向按 conntrack 原始方向归一化，响应包不会生成错误的出站条目
+  - 配置项：`offload`（开关）、`offloadTtl`（过期时间，默认 60s）、`offloadThreshold`（触发阈值，默认 3）
+  - 入站 set 使用三元组 `ipv4_addr . ipv4_addr . inet_service`（客户端、容器、端口），出站 set 使用二元组 `ipv4_addr . inet_service`（远端、端口）；分别使用 `offload_in_*` / `offload_out_*` 四个集合
+- 新增 NFQueue 多队列 fanout：`queue num 100-N` 按 flow hash 分发到多个队列，每个队列独立读取，突破单读线程上限
+  - 配置项：`queues`（队列数量，默认 `min(NumCPU, 8)`，设为 1 可关闭）
+- verdict 批量回写：每个队列使用独立 netlink 发送协程，通过单次 `sendmsg` 批量提交多个 verdict，减少系统调用
+- offload convergence 只提升 drop：同一 IP 多个端口被阻断达到阈值后加入 `convergence_drop` 并整 IP 封禁；不再生成 `convergence_allow`，避免整 IP 绕过检测
+- 规则匹配与每包路径优化：复用 expr 环境/VM、缓存流地址字符串、sharded offload 计数、批量 nftables 写入、零分配 conntrack ID 解析、日志惰性求值等
